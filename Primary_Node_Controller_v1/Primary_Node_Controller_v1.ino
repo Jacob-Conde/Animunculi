@@ -1,3 +1,11 @@
+/*
+Changes since last commit:
+-- ConfigLCD now just stores the pointers to the page objects and uses structure dereference to use the page methods
+-- LCD Enter input and analog data editing works now -- the config LCD is minimally functional, but it works
+-- Current issues: analog data input does not use the full range of the pot for some unknown reason
+   - when you modify the field data to a value with fewer digits it does not draw over the old least significant digits until you cycle through the pages -simple fix
+*/
+
 /* NOTES
   Weekdays start at sunday=weekday() = 1
   
@@ -267,8 +275,9 @@ class ConfigLCDPage {
 class ConfigLCD {
   private:
     static const uint8_t  _TOTALPAGES = 3; //The total number of pages that can be stored, change if more are needed
-    ConfigLCDPage _pages[_TOTALPAGES]; //This will store the address of all the ConfigLCDPage objects to make it easier to iterate through the pages
-    uint8_t _pageCount = 0; //Total number of pages stored in the _pages array
+    ConfigLCDPage* _pages_p[_TOTALPAGES];
+    //ConfigLCDPage _pages[_TOTALPAGES]; //This will store the address of all the ConfigLCDPage objects to make it easier to iterate through the pages
+    uint8_t _pageCount = 0; //Total number of pages stored in the _pages_p array
     uint8_t _currentPage = 1; //Stores the page number of the currently displayed configLCD page
     uint8_t _currentEditLine = 0; //Stores the line with data that is being editing, and needs to be updated on the LCD while the edit is in progress
     bool _currentlyEditingData = false;
@@ -279,15 +288,21 @@ class ConfigLCD {
     //  backlight, init    
     //}
 
-    bool addPage(ConfigLCDPage page){
+
+    //This is quickly becoming indecipherable, stop the bleeding asap
+    bool addPage(ConfigLCDPage *page_p){
       if(_pageCount >= _TOTALPAGES){
         Serial.println("ConfigLCD: page limit reached, cannot add new page");
         return false;
       }
-      _pages[_pageCount] = page; //Do I need to use a pointer here? probably not
-      _pageCount++;
+      _pages_p[_pageCount] = page_p;
+      //_pages[_pageCount] = *page_p; //Here i go dereferencing again
+
       //Page numbers are not 0-indexed, so the display page number is always 1 higher than the index
-      page.setPageNumber(_pageCount);
+      _pageCount++;
+      _pages_p[_pageCount - 1]->setPageNumber(_pageCount);
+
+      Serial.println("Page added");
       return true;
     }
 
@@ -300,37 +315,43 @@ class ConfigLCD {
         Serial.println("ConfigLCD: _currentPage has invalid value (out of range)");
         //Reset to page 1
         _currentPage = 1;
-        _pages[_currentPage - 1].drawPage();
+        _pages_p[_currentPage - 1]->drawPage();
         return false;
       }
 
       if(_currentPage == _TOTALPAGES){ //Case for being on the last page, want to loop around to the beginning
         _currentPage = 1;
-        _pages[_currentPage - 1].drawPage();
+        _pages_p[_currentPage - 1]->drawPage();
         return true;
       }
 
       if(_currentPage < _TOTALPAGES){ //Increment the page
         _currentPage++;
-        _pages[_currentPage - 1].drawPage();
+        _pages_p[_currentPage - 1]->drawPage();
         return true;
+      }
+      else{
+        Serial.println("this should not be possible");
+        return false;
       }
     }
 
     //This feels like this isn't the best way to go about doing this, like it seems inefficient but whatever
     uint16_t computeAnalogDataValue(){
       //check user cursor line
-      //uint8_t cursorLine = _pages[_currentPage - 1].getUserCursorLine();
+      //uint8_t cursorLine = _pages_p[_currentPage - 1].getUserCursorLine();
 
       //get the min/max for the field data stored on that line
-      uint16_t dataMin = _pages[_currentPage - 1].getFieldDataMin(_currentEditLine);
-      uint16_t dataMax = _pages[_currentPage - 1].getFieldDataMax(_currentEditLine);
+      uint16_t dataMin = _pages_p[_currentPage - 1]->getFieldDataMin(_currentEditLine);
+      uint16_t dataMax = _pages_p[_currentPage - 1]->getFieldDataMax(_currentEditLine);
 
       //get the analog input value (0-1023)
       uint16_t rawInput = analogRead(ANALOG_LCD_PIN);
 
       //map the analog input value to the valid fieldData range
       uint16_t mappedOutput = uint16_t(map(rawInput, 0, 1023, dataMin, dataMax));
+
+      Serial.println(mappedOutput);
 
       return mappedOutput;
     }
@@ -340,7 +361,7 @@ class ConfigLCD {
       //static bool currentlyEditingData = false;
       //static uint8_t currentlyEditingLine = 0; //You can't edit line 0, so that will be the "null" value for this variable
       Serial.println("Enter input registered");
-      uint8_t cursorLine = _pages[_currentPage - 1].getUserCursorLine();
+      uint8_t cursorLine = _pages_p[_currentPage - 1]->getUserCursorLine();
 
       //If the cursor is the title line, go to the next page
       if (cursorLine == 0) {
@@ -357,12 +378,12 @@ class ConfigLCD {
         }
         //Confirmation of the altered data
         else if ((_currentlyEditingData == true) && (_currentEditLine == cursorLine)){
-          _pages[_currentPage - 1].setFieldData(_currentEditLine, _pages[_currentPage - 1].tempData); //Write the temp data to the actual fieldData variable
+          _pages_p[_currentPage - 1]->setFieldData(_currentEditLine, _pages_p[_currentPage - 1]->tempData); //Write the temp data to the actual fieldData variable
           
           //Reset Flags
           _currentlyEditingData = false;
           _currentEditLine = 0;
-          _pages[_currentPage - 1].tempData = 0;
+          _pages_p[_currentPage - 1]->tempData = 0;
         }
       }
 
@@ -378,13 +399,13 @@ class ConfigLCD {
       //Escape from editing a fieldData value (by moving the cursor down to the next line)
       Serial.println("Scroll input registered");
 
-      if(_currentlyEditingData = true){
+      if((_currentlyEditingData == true)){
         _currentlyEditingData = false;
-        _pages[_currentPage - 1].printFieldDatum(_currentEditLine); //Reset the displayed data to the stored value
+        _pages_p[_currentPage - 1]->printFieldDatum(_currentEditLine); //Reset the displayed data to the stored value
         _currentEditLine = 0;
       }
 
-      _pages[_currentPage - 1].moveCursor();
+      _pages_p[_currentPage - 1]->moveCursor();
     }
 
     //Method to update a data value that is being edited. This method should be placed in the main loop and needs to be check every loop.
@@ -392,13 +413,14 @@ class ConfigLCD {
       if (_currentlyEditingData == false){
         return false;
       }
-      if (_currentEditLine = 0){
+      if (_currentEditLine == 0){
         return false;
       }
 
       if ((_currentEditLine > 0) && (_currentEditLine <= 3)){
-        _pages[_currentPage - 1].tempData = computeAnalogDataValue();
-        _pages[_currentPage - 1].printTempFieldData(_currentEditLine);
+        Serial.println("checking analog value");
+        _pages_p[_currentPage - 1]->tempData = computeAnalogDataValue();
+        _pages_p[_currentPage - 1]->printTempFieldData(_currentEditLine);
       }
 
       return true;
@@ -471,9 +493,6 @@ void setup() {
 
 
 
-  mainDisplay.addPage(page1);
-  mainDisplay.addPage(page2);
-  mainDisplay.addPage(page3);
 
   page1.setPageTitle("Big Long Title");
   page1.setPageNumber(1);
@@ -483,10 +502,16 @@ void setup() {
   page1.initFieldData(2, 100, 99, 101);
   page1.setFieldTitle("toodaloo:", 3);
   page1.initFieldData(3, 30000, 1, 31000);
-  page1.drawPage();
+  //page1.drawPage();
 
   page2.setPageTitle("page 2");
   page3.setPageTitle("page3");
+
+  //Pages need to be added after they are configured, probably need to use pointers in the methods to set data in ConfigLCDPage in order to update later?
+  mainDisplay.addPage(&page1);
+  mainDisplay.addPage(&page2);
+  mainDisplay.addPage(&page3);
+
 
   //lcd.setCursor(18,0);
   //lcd.cursor_on();
@@ -561,7 +586,7 @@ void loop() {
     }
     else{
       lockoutScrollTime = millis();
-      Serial.println("Scroll input seen in main loop");
+      //Serial.println("Scroll input seen in main loop");
       mainDisplay.inputActionScroll();
     }
   }
@@ -573,7 +598,7 @@ void loop() {
     }
     else{
       lockoutEnterTime = millis();
-      Serial.println("Enter input seen in main loop");
+      //Serial.println("Enter input seen in main loop");
       mainDisplay.inputActionEnter();
     }
   }
