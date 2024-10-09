@@ -1,15 +1,13 @@
 /*
 Changes since last commit:
--- ConfigLCD now just stores the pointers to the page objects and uses structure dereference to use the page methods
--- LCD Enter input and analog data editing works now -- the config LCD is minimally functional, but it works
--- Current issues: analog data input does not use the full range of the pot for some unknown reason
-   - when you modify the field data to a value with fewer digits it does not draw over the old least significant digits until you cycle through the pages -simple fix
+-- Functionality for the debugLCD to turn the lamp on and off, and reflect the current state of the lamp on the screen
+-- Fixed a bug where the lamp would turn off when I turned on my PC after an alarm driven state change.
 */
 
 /* NOTES
   Weekdays start at sunday=weekday() = 1
   
-  Lamp command structure
+  CAN frame structure
   byte 0: current state of the lamp (On = 0x01, Off = 0x00)
   byte 1: command state of the lamp (On = 0xFF, Off = 0x11, no change = 0x00)
   byte 2: reserved
@@ -21,14 +19,12 @@ Changes since last commit:
 */
 
 /*TODO - project
-  Test lamp node comtroller on bare ATmega328p
-  Relay control schematic
-  Build lamp node circuit
-  Manual input at lamp node - gesture sensor to activate lamp and send state change over canbus to primary
-    Code and circuit
+  Code cleanup -- this shit is a mess and it's not going to get any better without effort
+  Incorporate the APDS9960 gesture sensor
+  Add functionality to change the long/short work week flag from the configLCD interface
   
   Future:
-    Give config LCD its own controller and either have it talk on the CAN bus or have an SPI or I2C connection to the primary node (pros/cons of each approach?)
+    Give config LCD its own controller and either have it communicate on the CAN bus or have an SPI or I2C connection to the primary node (pros/cons of each approach?)
 
 */
 
@@ -36,13 +32,10 @@ Changes since last commit:
   Send debug messages from secondary nodes over canbus to be Serial.print ed on the main node? message page on lcd?
   Config LCD pages
     Set flag islongworkweek, master enable/diable of all lamp alarms
-    Manually activate lamp from menu
     Change alarm times/ schedule? -- low priority
     View current time on RTC -- low priority
   
   Break out all class definitions to separate file, write header file
-
-
 
 */
 
@@ -53,13 +46,11 @@ Changes since last commit:
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-
 /*
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 Definitions, Constants, Variables in the Global Scope, and Other Sundry Items That Just Need to be Before the Class Definitions.
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 */
-
 
 #define CAN_BITRATE 125000 //CAN bus bitrate in bps
 #define BAUD_RATE 115200 //Serial baud rate for communication with PC
@@ -78,12 +69,12 @@ static const uint16_t LAMP_NODE_ID = 0x010;
 //Initialize the LCD
 LiquidCrystal_I2C lcd(0x3F, 20, 4);
 
-
-//Polluting the global scope
-bool isLongWorkWeek = false; //Long week work days are Sun, M, Th, F. Short week (false) is Tu, W, Sat
-uint8_t lampState = 0; //The true lampState is stored in the lamp object on the local node, and is sent back to the primary node after a state change and stored here
-
-
+  bool isLongWorkWeek = true; //Long week work days are Sun, M, Th, F. Short week (false) is Tu, W, Sat
+ // uint16_t* p_isLongWorkWeek = &isLongWorkWeek;
+  uint8_t lampState = 0; //The true lampState is stored in the lamp object on the local node, and is sent back to the primary node after a state change and stored here
+  //uint16_t* p_lampState = &lampState;
+  uint16_t lampOnFlag = 0;
+  uint16_t* p_lampOnFlag = &lampOnFlag;
 
 /*
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
@@ -91,8 +82,6 @@ Class Definitions
 TODO: Write header file and move lcd class definitions to their own file
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 */
-
- 
 
 //Naming note: configLCD refers to the LCD that will be used by the end user (me)  to configure various values
 //Ideas for how the config LCD will work:
@@ -102,18 +91,20 @@ $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 class ConfigLCDPage {
   private:
     static const uint8_t PAGE_TITLE_LEN = 17;
-    //static const uint8_t FIELD_TITLE_LEN 12; //not currently used, maybe should be used to enforce max length?
     uint8_t _pageNumber;
     String _pageTitle = "NULLTITLE";
     String _fieldTitleArr[3] = {"", "", ""};
     uint8_t _fieldDataStartArr[3] = {0, 0, 0}; //This is the first column on each line after the title that is valid to print data
+
+    //The actual field data
     int16_t _fieldData16[3] = {0, 0, 0};
+    int16_t* _p_fieldData16ExternalVars[3];
+
     int16_t _fieldData16_min[3] = {0, 0, 0};
     int16_t _fieldData16_max[3] = {0, 0, 0};
-    //String _fieldDataStr[3];
+
     uint8_t _userCursorLine = 0; //Track the line that the user has moved the cursor to, reference this to update values in response to input
     bool _isEditable = true; //Flag to lock edit functionality on pages with read-only data (eg clock display) 
-
 
   public:
     //ConfigLCDPage(uint8_t pageNumber); //Constructor
@@ -138,8 +129,9 @@ class ConfigLCDPage {
 
     //Set 16 bit values to the data fields
     //minData and maxData are the ends of the range of valid values for fieldData
+    //p_exeternalVar is a pointer to an external variable that will get updated when that field datum changes
     //TODO: function overloading if need be for strings
-    bool initFieldData(int8_t fieldNumber, int16_t fieldData, int16_t minData, int16_t maxData){
+    bool initFieldData(int8_t fieldNumber, int16_t fieldData, int16_t minData, int16_t maxData, int16_t* p_externalVar){
       if((fieldNumber < 1) || (fieldNumber > 3)){
         Serial.println("Invalid field number");
         return false;
@@ -154,6 +146,8 @@ class ConfigLCDPage {
       _fieldData16[fieldNumber-1] = fieldData;
       _fieldData16_min[fieldNumber-1] = minData;
       _fieldData16_max[fieldNumber-1] = maxData;
+
+      _p_fieldData16ExternalVars[fieldNumber-1] = p_externalVar;
 
       return true;
     }
@@ -171,9 +165,10 @@ class ConfigLCDPage {
         Serial.println(fieldNumber);
         return false;
       }
-      //Update the data value
+      //Update the data value and the external variable
       else{
         _fieldData16[fieldNumber - 1] = fieldData;
+        *_p_fieldData16ExternalVars[fieldNumber -1] = fieldData;
         return true;
       }
 
@@ -227,6 +222,8 @@ class ConfigLCDPage {
     void printFieldDatum(uint8_t fieldNumber){
       //Set the cursor to the first safe column to write data without overwriting the field titles
       lcd.setCursor(_fieldDataStartArr[fieldNumber - 1], fieldNumber);
+      lcd.print("      "); //I'm too lazy to do the math on this, 6 spaces should be good enough 99% of the time
+      lcd.setCursor(_fieldDataStartArr[fieldNumber - 1], fieldNumber);
       lcd.print(_fieldData16[fieldNumber - 1]);
 
       lcd.setCursor(18, _userCursorLine); //Move the cursor back to where it was before this function was called
@@ -261,12 +258,11 @@ class ConfigLCDPage {
       //Print the field data
       printFieldData();
 
-      //Place the cursor right before the page number, as a default position
-      lcd.setCursor(17,0);
+      //Place the cursor right after the page number, as a default position
+      lcd.setCursor(19,0);
       _userCursorLine = 0;
 
     }
-
 };
 
 //The ConfigLCD class will be the object representation of the real-life configLCD
@@ -287,7 +283,6 @@ class ConfigLCD {
     //ConfigLCD(address, lines, columns){
     //  backlight, init    
     //}
-
 
     //This is quickly becoming indecipherable, stop the bleeding asap
     bool addPage(ConfigLCDPage *page_p){
@@ -351,11 +346,13 @@ class ConfigLCD {
       //map the analog input value to the valid fieldData range
       uint16_t mappedOutput = uint16_t(map(rawInput, 0, 1023, dataMin, dataMax));
 
+      Serial.print("rawinput: ");
+      Serial.print(rawInput);
+      Serial.print(", mappedOutput: ");
       Serial.println(mappedOutput);
 
       return mappedOutput;
     }
-
 
     void inputActionEnter(){
       //static bool currentlyEditingData = false;
@@ -366,6 +363,18 @@ class ConfigLCD {
       //If the cursor is the title line, go to the next page
       if (cursorLine == 0) {
         nextPage();
+        Serial.println("Enter input on line 0, moving to next page");
+      }
+      
+      //Confirmation of the altered data
+      if ((_currentlyEditingData == true) && (_currentEditLine == cursorLine)){
+        _pages_p[_currentPage - 1]->setFieldData(_currentEditLine, _pages_p[_currentPage - 1]->tempData); //Write the temp data to the actual fieldData variable
+        Serial.println("Temp data written to fieldData variable");
+        
+        //Reset Flags
+        _currentlyEditingData = false;
+        _currentEditLine = 0;
+        _pages_p[_currentPage - 1]->tempData = 0;
       }
 
       //If the cursor is on a data line, mark that line as the line currently being edited
@@ -373,25 +382,18 @@ class ConfigLCD {
         if ((_currentlyEditingData == false) && (_currentEditLine == 0)){
           _currentlyEditingData = true;
           _currentEditLine = cursorLine;
+          Serial.print("Initiating edit, currently editing data on line ");
+          Serial.println(cursorLine);
 
           //from here we need to compute the analog data value, continuously update it on the LCD, but only update the fieldData variable upon a second enter press
         }
-        //Confirmation of the altered data
-        else if ((_currentlyEditingData == true) && (_currentEditLine == cursorLine)){
-          _pages_p[_currentPage - 1]->setFieldData(_currentEditLine, _pages_p[_currentPage - 1]->tempData); //Write the temp data to the actual fieldData variable
-          
-          //Reset Flags
-          _currentlyEditingData = false;
-          _currentEditLine = 0;
-          _pages_p[_currentPage - 1]->tempData = 0;
-        }
-      }
 
       //When you press the enter button, you might want to do the following:
       //Go to the next page (cursor is on line 0)
       //Edit a data field (cursor is on line 1-3)
       //Confirm edited data (cursor is on line 1-3, already selected the line)
     }
+  }
 
     void inputActionScroll(){
       //When you press the scroll button, you might want to do the following:
@@ -424,11 +426,7 @@ class ConfigLCD {
       }
 
       return true;
-
-
     }
-
-
 };
 
 /*
@@ -473,14 +471,10 @@ void setup() {
   Serial.println("Waiting for sync message");
 
   //Init RTC
-  while(1){
-    syncRTC();
-    if (now() > 1700000000){ //Nov 14 2023 unix timestamp, if it greater than this it hasn't reset completely
-    //whether or not it's correct is left as an exercise to the reader
-      Serial.println("RTC Init Complete");
-      break;
-    } 
+  while(now() < 1700000000){ //Nov 14 2023 unix timestamp, if it greater than this it hasn't reset completely
+    syncRTC(); 
   }
+  Serial.println("RTC Init Complete");
 
   //Define data direction for config LCD input pins
   pinMode(ANALOG_LCD_PIN, OUTPUT);
@@ -490,18 +484,14 @@ void setup() {
   lcd.init();
   lcd.backlight();
 
-
-
-
-
-  page1.setPageTitle("Big Long Title");
+  page1.setPageTitle("LAMP");
   page1.setPageNumber(1);
-  page1.setFieldTitle("hello:", 1);
-  page1.initFieldData(1, 69, 0, 100);
-  page1.setFieldTitle("more data:", 2);
-  page1.initFieldData(2, 100, 99, 101);
-  page1.setFieldTitle("toodaloo:", 3);
-  page1.initFieldData(3, 30000, 1, 31000);
+  page1.setFieldTitle("LampIsOn:", 1);
+  page1.initFieldData(1, lampOnFlag, 0, 1, p_lampOnFlag);
+  page1.setFieldTitle("LampState", 2);
+  //page1.initFieldData(2, lampState, 0, 1, p_lampState);
+  page1.setFieldTitle("isLongWeek", 3);
+  //page1.initFieldData(3, isLongWorkWeek, 0, 1, p_isLongWorkWeek);
   //page1.drawPage();
 
   page2.setPageTitle("page 2");
@@ -512,11 +502,12 @@ void setup() {
   mainDisplay.addPage(&page2);
   mainDisplay.addPage(&page3);
 
+  //Draw the first so it doesn't start with a blank screen
+  page1.drawPage();
 
   //lcd.setCursor(18,0);
   //lcd.cursor_on();
   lcd.blink(); 
-
 
   //Initialize alarms, only set alarms after the RTC is initialized with the correct time
   //Set the time alarm to switch the long or short work week flag on Saturdays at 11:59:59 pm
@@ -525,20 +516,9 @@ void setup() {
   Alarm.alarmRepeat(0, 1, 0, alarmScheduler);
 
   //Delete this
-  debugAlarms();
+  //debugAlarms();
 
 }
-
-/*
-$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-LCD Object Setup (In the global scope)
-$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-*/
-
-
-
-
-
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -546,18 +526,18 @@ $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-
-
 //the node controller will send back the state of the lamp whenver it changes
-bool timerFlag = true;
-static const uint8_t digitalInputLockoutTime = 200; //Used to reject repeated digital inputs, in milliseconds
+static const uint8_t digitalInputLockoutPeriod = 200; //Used to reject repeated digital inputs, in milliseconds
+// uint32_t cycleCount = 0;
+// unsigned long cycleTime;
 uint32_t lockoutScrollTime = millis();
 uint32_t lockoutEnterTime = millis();
+
 
 void loop() {
   
   
-  uint32_t loopStartTime = micros();
+  // unsigned long loopStartTime = micros();
 
   //Check the state of each digital input
   uint8_t startScrollInputState = digitalRead(SCROLL_LCD_PIN);
@@ -580,7 +560,7 @@ void loop() {
   mainDisplay.updateFieldDataDisplayWhileEditing();
 
   if(digitalRead(SCROLL_LCD_PIN)){
-    if((millis() - lockoutScrollTime) < digitalInputLockoutTime){
+    if((millis() - lockoutScrollTime) < digitalInputLockoutPeriod){
       //Serial.println("Scroll input locked");
       ;
     }
@@ -592,7 +572,7 @@ void loop() {
   }
 
   if(digitalRead(ENTER_LCD_PIN)){
-    if((millis() - lockoutEnterTime) < digitalInputLockoutTime){
+    if((millis() - lockoutEnterTime) < digitalInputLockoutPeriod){
       //Serial.println("Enter input locked");
       ;
     }
@@ -600,6 +580,12 @@ void loop() {
       lockoutEnterTime = millis();
       //Serial.println("Enter input seen in main loop");
       mainDisplay.inputActionEnter();
+      if(lampOnFlag && !lampState){
+        turnOnLamp();
+      }
+      else if(!lampOnFlag && lampState){
+        turnOffLamp();
+      }
     }
   }
   
@@ -607,24 +593,22 @@ void loop() {
   //The conditions for the alarms are only checked during an Alarm.delay()
   Alarm.delay(0);
 
-  if(timerFlag){
-    Serial.print("Main loop time: ");
-    Serial.println(micros() - loopStartTime);
-    timerFlag = false;
-  }
-
-
-
+  //Print out the cycle time every once in a while
+  // if(cycleCount % 1000 == 0){
+  //   cycleTime = (micros() - loopStartTime);
+  //   Serial.print("Scan cycle: ");
+  //   Serial.print(cycleCount);
+  //   Serial.print(", Scan cycle time: ");
+  //   Serial.println(cycleTime);
+  // }
+  // cycleCount++;
 }
-
-
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //END OF MAIN LOOP
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 
 
 /*
@@ -634,7 +618,7 @@ $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 */
 
 void toggleisLongWorkWeekFlag(){
-  isLongWorkWeek = !isLongWorkWeek;
+  isLongWorkWeek = !(isLongWorkWeek);
 }
 
 void alarmScheduler(){
@@ -646,7 +630,7 @@ void alarmScheduler(){
       lampAlarmSchedule();
     }
   }
-  else if(!isLongWorkWeek){
+  else if(!(isLongWorkWeek)){
     if(day == 3 || day == 4 || day == 7){
       lampAlarmSchedule();
     }
@@ -665,8 +649,8 @@ void lampAlarmSchedule(){
 //FOR DEBUGGING PURPOSES ONLY
 void debugAlarms(){
   //DEBUG ONLY
-  Alarm.alarmOnce(20, 3, 30, turnOnLamp);
-  Alarm.alarmOnce(20, 4, 30, turnOffLamp);
+  Alarm.alarmOnce(8, 0, 30, turnOnLamp);
+  Alarm.alarmOnce(9, 30, 30, turnOffLamp);
 }
 
 //Sends a CAN bus message to the lamp node controller to command it to the desired state.
@@ -676,8 +660,7 @@ void turnOnLamp(){
   uint8_t messageData[8] = {lampState, 0xFF};
   sendCANFrame(PRIMARY_NODE_ID, 2, messageData);
   
-  Serial.println("Command issued to turn lamp ON");
-  digitalClockDisplay();
+  //Serial.println("Command issued to turn lamp ON");
 }
 
 void turnOffLamp(){
@@ -685,19 +668,14 @@ void turnOffLamp(){
   uint8_t messageData[8] = {lampState, 0x11};
   sendCANFrame(PRIMARY_NODE_ID, 2, messageData);
   
-  Serial.println("Command issued to turn lamp OFF");
-  digitalClockDisplay();
+  //Serial.println("Command issued to turn lamp OFF");
 }
-
-
 
 /*
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 CAN Land
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 */
-
-
 
 bool sendCANFrame(uint16_t messageID, uint8_t messageLen, uint8_t messageData[8]){
   //Return true/false is succesful?
@@ -714,11 +692,11 @@ bool sendCANFrame(uint16_t messageID, uint8_t messageLen, uint8_t messageData[8]
 
   const bool ok = ACAN_T4::can1.tryToSend(message);
   if(ok){
-    Serial.println("Frame sent");
+    Serial.println("sendCANFrame: Frame sent");
     return true;
   }
   else{
-    Serial.println("Frame send failure");
+    //Serial.println("Frame send failure");
     return false;
   }
 }
@@ -743,23 +721,17 @@ bool receiveCANFrame(){
     Serial.println(incomingFrame.id);
     Serial.print("Len: ");
     Serial.println(incomingFrame.len);
-    Serial.println("Data: ");  
-    Serial.println(incomingFrame.data[0]);
-    Serial.println(incomingFrame.data[1]);
-    Serial.println(incomingFrame.data[2]);
-    Serial.println(incomingFrame.data[3]);
-    Serial.println(incomingFrame.data[4]);
-    Serial.println(incomingFrame.data[5]);
-    Serial.println(incomingFrame.data[6]);
+    Serial.println("Frame Bytes: ");
+    for(int i = 0; i < 7; i++){
+      Serial.print(incomingFrame.data[i]);
+      Serial.print(" ");
+    }  
     Serial.println(incomingFrame.data[7]);
 
     Serial.print("Lamp State: ");
     Serial.println(lampState);
-
-
     return true;
   }
-
   return false;
 }
 
@@ -768,23 +740,19 @@ void checkCANMessageBuffer(){
   if(ACAN_T4::can1.available()){
     bool ok = receiveCANFrame();
     if(ok){
-      Serial.println("Frame reception success");
+      Serial.println("checkCANMessageBuffer: Frame reception success");
     }
     else{
-      Serial.println("Frame reception error");
+      Serial.println("checkCANMessageBuffer: Frame reception error");
     }
   }
 }
-
-
 
 /*
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 Real Time Clock & Timekeeping Functions
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 */
-
-
 
 void syncRTC(){
   if (Serial.available()) {
