@@ -69,8 +69,6 @@ static const uint16_t LAMP_NODE_ID = 0x010;
 //Initialize the LCD
 LiquidCrystal_I2C lcd(0x3F, 20, 4);
 
-  bool isLongWorkWeek = true; //Long week work days are Sun, M, Th, F. Short week (false) is Tu, W, Sat
- // uint16_t* p_isLongWorkWeek = &isLongWorkWeek;
   uint8_t lampState = 0; //The true lampState is stored in the lamp object on the local node, and is sent back to the primary node after a state change and stored here
   //uint16_t* p_lampState = &lampState;
   uint16_t lampOnFlag = 0;
@@ -490,8 +488,6 @@ void setup() {
   page1.initFieldData(1, lampOnFlag, 0, 1, p_lampOnFlag);
   page1.setFieldTitle("LampState", 2);
   //page1.initFieldData(2, lampState, 0, 1, p_lampState);
-  page1.setFieldTitle("isLongWeek", 3);
-  //page1.initFieldData(3, isLongWorkWeek, 0, 1, p_isLongWorkWeek);
   //page1.drawPage();
 
   page2.setPageTitle("page 2");
@@ -510,8 +506,6 @@ void setup() {
   lcd.blink(); 
 
   //Initialize alarms, only set alarms after the RTC is initialized with the correct time
-  //Set the time alarm to switch the long or short work week flag on Saturdays at 11:59:59 pm
-  Alarm.alarmRepeat(dowSaturday, 23, 59, 59, toggleisLongWorkWeekFlag);
   //Set an alarm at the beginning of every day to schedule that day's events every day at 12:01:00 am
   Alarm.alarmRepeat(0, 1, 0, alarmScheduler);
 
@@ -617,23 +611,12 @@ Lamp Functions
 $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
 */
 
-void toggleisLongWorkWeekFlag(){
-  isLongWorkWeek = !(isLongWorkWeek);
-}
-
 void alarmScheduler(){
   int day = weekday();
 
   //use the enum dowWeekday format to make this more readable
-  if(isLongWorkWeek){
-    if(day == 1 || day == 2 || day == 5 || day == 6){
-      lampAlarmSchedule();
-    }
-  }
-  else if(!(isLongWorkWeek)){
-    if(day == 3 || day == 4 || day == 7){
-      lampAlarmSchedule();
-    }
+  if(day == 2 || day == 3 || day == 4 || day == 5 || day == 6){
+    lampAlarmSchedule();
   }
 
   Serial.println("Alarm set");
@@ -642,7 +625,7 @@ void alarmScheduler(){
 
 void lampAlarmSchedule(){
   Alarm.alarmOnce(5, 5, 0, turnOnLamp); //Send command to turn on lamp at 5:05 am
-  Alarm.alarmOnce(6, 20, 0, turnOffLamp); //Send command to turn off lamp at 6:20 am
+  Alarm.alarmOnce(6, 30, 0, turnOffLamp); //Send command to turn off lamp at 6:30 am
 
 }
 
